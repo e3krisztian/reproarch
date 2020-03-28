@@ -65,21 +65,24 @@ from pprint import pprint
 
 
 def parse_keyword(word):
-    key, sep, value = word.partition(b'=')
+    key, _sep, value = word.partition(b'=')
     return key.strip(), value.strip()
 
 
-OCTALS_REFS = re.compile(r'\\([0-7][0-7][0-7])')
+OCTALS_REFS = re.compile(rb'\\([0-7][0-7][0-7])')
 
 
-def octal_match_to_char(octal_match):
-    return chr(int(octal_match.group(1), base=8))
+def octal_match_to_char(octal_match: bytes) -> bytes:
+    return bytes([int(octal_match.group(1), base=8)])
 
 
-def parse_path(word):
-    return OCTALS_REFS.sub(octal_match_to_char, word)
+def parse_path(word: bytes) -> str:
+    return OCTALS_REFS.sub(octal_match_to_char, word).decode('utf-8')
 
-assert parse_path('/path/to/strange\\033file') == '/path/to/strange\x1bfile'
+assert parse_path(b'/path/to/strange\\033file') == '/path/to/strange\x1bfile'
+
+# regression test for subtle bug, when converting first to utf-8, then resolving the octal references
+assert parse_path(b'./usr/lib/go/test/fixedbugs/issue27836.dir/\\303\\204foo.go') == './usr/lib/go/test/fixedbugs/issue27836.dir/Äfoo.go'
 
 
 open_mtree = gzip.open
@@ -112,9 +115,7 @@ def parse_mtree(file_name, root='/'):
             else:
                 words = line.split()
                 first_word = words[0]
-                parsed_keywords = dict(
-                    parse_keyword(word)
-                    for word in words[1:])
+                parsed_keywords = dict(parse_keyword(word) for word in words[1:])
                 if first_word == b'/set':
                     global_keywords.update(parsed_keywords)
                 elif first_word == b'/unset':
@@ -124,7 +125,7 @@ def parse_mtree(file_name, root='/'):
                 else:
                     keywords = global_keywords.copy()
                     keywords.update(parsed_keywords)
-                    path = parse_path(first_word.decode('utf-8'))
+                    path = parse_path(first_word)
                     abspath = os.path.normpath(os.path.join(root, path))
                     if get_type(keywords) == b'dir':
                         if '/' not in path:
@@ -170,6 +171,10 @@ SKIP_NEW = [
         '^/boot/EFI/BOOT/icons',
         # FIXME: package pacman-mirrorlist ?
         '^/etc/pacman.d/gnupg/',
+        # files that are created during use/not really worth backing up
+        '^/var/log/',
+        '^/var/lib/docker',
+        '/.cache/',
     )]
 
 
