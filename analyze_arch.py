@@ -24,6 +24,7 @@ This "some data file" should include:
 - a script to install a new system and modify it as needed
 '''
 
+import argparse
 import contextlib
 from datetime import datetime
 from glob import glob
@@ -31,6 +32,7 @@ import gzip
 import hashlib
 import re
 import os
+import tarfile
 from typing import Tuple, Set
 
 MEGABYTE = 1_000_000
@@ -86,7 +88,39 @@ def main():
     print_file_list('Missing', missing)
     print_file_list('Changed', changed)
 
-    print_sizes('Archive size', new | changed)
+    print_sizes('Uncompressed new files archive size', new)
+    archive(new, 'new.tar.gz')
+    print_sizes('Uncompressed changed files archive size', changed)
+    archive(changed, 'changed.tar.gz')
+
+
+REPORTED_SIZE = 5_000_000
+
+def print_sizes(msg, paths) -> int:
+    print()
+    print(f'Calculating file sizes (showing files that are more than {REPORTED_SIZE} big):')
+    sum_sizes = 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            if size > REPORTED_SIZE:
+                print(f'- {path}: {size / MEGABYTE:0.2f}MB')
+            sum_sizes += size
+        except Exception as e:
+            assert path in str(e)
+            print(f'- ERROR: {e}')
+    print(f'{msg}: {sum_sizes}')
+
+
+def archive(files, output):
+    if not files:
+        print(f'no files to write to {output} - it is not created')
+        return
+    print(f'Creating archive {output}:')
+    with tarfile.open(output, 'w:gz') as archive:
+        for file in sorted(files):
+            print(f'- {file}')
+            archive.add(file, recursive=False)
 
 
 def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
@@ -123,24 +157,6 @@ def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
             if not same_as_installed(path, mtree_keywords[path]))
 
     return new, missing, changed
-
-
-REPORTED_SIZE = 5_000_000
-
-def print_sizes(msg, paths) -> int:
-    print()
-    print(f'Calculating file sizes (showing files that are more than {REPORTED_SIZE} big):')
-    sum_sizes = 0
-    for path in paths:
-        try:
-            size = os.path.getsize(path)
-            if size > REPORTED_SIZE:
-                print(f'- {path}: {size / MEGABYTE:0.2f}MB')
-            sum_sizes += size
-        except Exception as e:
-            assert path in str(e)
-            print(f'- ERROR: {e}')
-    print(f'{msg}: {sum_sizes}')
 
 
 ###
