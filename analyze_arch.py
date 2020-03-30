@@ -33,6 +33,116 @@ import re
 import os
 from typing import Tuple, Set
 
+MEGABYTE = 1_000_000
+
+KNOWN_NOT_PACKAGE_INSTALLED_AND_IGNORED_CHECKERS = [
+    re.compile(x).search
+    for x in (
+        '^/home/',
+        '^/tmp/', '^/dev/', '^/proc/', '^/sys/', '^/run/',
+        # package ca-certificates-utils
+        '^/etc/ca-certificates/extracted/',
+        # package shared-mime-info
+        '^/usr/share/mime/',
+        # package ca-certificates-utils, openssl
+        '^/etc/ssl/certs/',
+        # ???
+        '^/boot/EFI/BOOT/icons',
+        # package pacman-mirrorlist ?
+        '^/etc/pacman.d/gnupg/',
+        # files that are created during use/not really worth backing up
+        '^/var/cache/',
+        '^/var/log/',
+        '^/var/tmp/',
+        '^/var/lib/docker',
+        '^/var/lib/pacman/',
+        '^/var/lib/systemd/coredump/',
+        '/.cache/',
+        # swap file[s]
+        '^/swap',
+    )]
+
+
+def known_not_package_installed_and_ignored(path):
+    return any(check(path) for check in KNOWN_NOT_PACKAGE_INSTALLED_AND_IGNORED_CHECKERS)
+
+
+def main():
+    if os.getuid() != 0:
+        print('WARNING: Not running as root!')
+        print(
+            'WARNING: Expect differences to reality due to ' +
+            'missing permissions to open files/look into directories.')
+
+    new, missing, changed = analyze_system()
+
+    def print_file_list(file_list_name, files):
+        print()
+        print(f'{file_list_name} {len(files)} files:')
+        for file in sorted(files):
+            print(f'- {file}')
+
+    print_file_list('New (unknown)', new)
+    print_file_list('Missing', missing)
+    print_file_list('Changed', changed)
+
+    print_sizes('Archive size', new | changed)
+
+
+def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
+    @contextlib.contextmanager
+    def progress(msg):
+        if verbosity:
+            start_time = datetime.now()
+            print()
+            print(f'STARTED {msg}')
+            yield
+            end_time = datetime.now()
+            print(f'DONE   ({msg}) in {end_time - start_time}')
+        else:
+            yield
+
+    with progress('reading install database (mtrees)'):
+        mtree_keywords = read_all_mtrees()
+        installed = set(mtree_keywords.keys())
+
+    with progress('reading file system'):
+        real_files = set(all_files())
+
+        new = set(
+            path
+            for path in real_files.difference(installed)
+            if not known_not_package_installed_and_ignored(path))
+
+        missing = installed.difference(real_files)
+
+    with progress('comparing file system against install database'):
+        changed = set(
+            path
+            for path in real_files.intersection(installed)
+            if not same_as_installed(path, mtree_keywords[path]))
+
+    return new, missing, changed
+
+
+REPORTED_SIZE = 5_000_000
+
+def print_sizes(msg, paths) -> int:
+    print()
+    print(f'Calculating file sizes (showing files that are more than {REPORTED_SIZE} big):')
+    sum_sizes = 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            if size > REPORTED_SIZE:
+                print(f'- {path}: {size / MEGABYTE:0.2f}MB')
+            sum_sizes += size
+        except Exception as e:
+            assert path in str(e)
+            print(f'- ERROR: {e}')
+    print(f'{msg}: {sum_sizes}')
+
+
 ###
 # mtree file parsing
 #
@@ -154,42 +264,8 @@ def all_files():
             yield os.path.join(dirpath, name)
 
 
-# XXX: should it be read from an external file???
-SKIP_NEW = [
-    re.compile(x).search
-    for x in (
-        '^/home/',
-        '^/tmp/', '^/dev/', '^/proc/', '^/sys/', '^/run/',
-        # package ca-certificates-utils
-        '^/etc/ca-certificates/extracted/',
-        # package shared-mime-info
-        '^/usr/share/mime/',
-        # package ca-certificates-utils, openssl
-        '^/etc/ssl/certs/',
-        # ???
-        '^/boot/EFI/BOOT/icons',
-        # package pacman-mirrorlist ?
-        '^/etc/pacman.d/gnupg/',
-        # files that are created during use/not really worth backing up
-        '^/var/cache/',
-        '^/var/log/',
-        '^/var/tmp/',
-        '^/var/lib/docker',
-        '^/var/lib/pacman/',
-        '^/var/lib/systemd/coredump/',
-        '/.cache/',
-        # swap file[s]
-        '^/swap',
-    )]
-
-
-def ignored_new(path):
-    for filter in SKIP_NEW:
-        if filter(path):
-            return True
-    return False
-
-
+###
+# Comparison
 def type_eq(path, keywords):
     type = get_type(keywords)
     return (
@@ -233,81 +309,6 @@ def same_as_installed(path, keywords):
         # not running as root?
         assert os.getuid() != 0
         return False
-
-
-@contextlib.contextmanager
-def progress(msg):
-    start_time = datetime.now()
-    print()
-    print(f'STARTED {msg}')
-    yield
-    end_time = datetime.now()
-    print(f'DONE   ({msg}) in {end_time - start_time}')
-
-
-def analyze_system(progress=progress) -> Tuple[Set[str], Set[str], Set[str]]:
-    with progress('reading install database (mtrees)'):
-        mtree_keywords = read_all_mtrees()
-        installed = set(mtree_keywords.keys())
-
-    with progress('reading file system'):
-        real_files = set(all_files())
-
-        new = set(
-            path
-            for path in real_files.difference(installed)
-            if not ignored_new(path))
-
-        missing = installed.difference(real_files)
-
-    with progress('comparing file system against install database'):
-        changed = set(
-            path
-            for path in real_files.intersection(installed)
-            if not same_as_installed(path, mtree_keywords[path]))
-
-    return new, missing, changed
-
-
-def main():
-    if os.getuid() != 0:
-        print('WARNING: Not running as root!')
-        print(
-            'WARNING: Expect differences to reality due to ' +
-            'missing permissions to open files/look into directories.')
-
-    new, missing, changed = analyze_system()
-
-    def print_file_list(file_list_name, files):
-        print()
-        print(f'{file_list_name} {len(files)} files:')
-        for file in sorted(files):
-            print(f'- {file}')
-
-    print_file_list('New (unknown)', new)
-    print_file_list('Missing', missing)
-    print_file_list('Changed', changed)
-
-    print_sizes('Archive size', new | changed)
-
-
-MEGABYTE = 1_000_000
-REPORTED_SIZE = 5_000_000
-
-def print_sizes(msg, paths) -> int:
-    print()
-    print(f'Calculating file sizes (showing files that are more than {REPORTED_SIZE} big):')
-    sum_sizes = 0
-    for path in paths:
-        try:
-            size = os.path.getsize(path)
-            if size > REPORTED_SIZE:
-                print(f'- {path}: {size / MEGABYTE:0.2f}MB')
-            sum_sizes += size
-        except Exception as e:
-            assert path in str(e)
-            print(f'- ERROR: {e}')
-    print(f'{msg}: {sum_sizes}')
 
 
 if __name__ == '__main__':
