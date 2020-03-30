@@ -24,14 +24,14 @@ This "some data file" should include:
 - a script to install a new system and modify it as needed
 '''
 
-from __future__ import unicode_literals
+import contextlib
+from datetime import datetime
+from glob import glob
+import gzip
+import hashlib
 import re
 import os
-import gzip
-from glob import glob
-import hashlib
-from pprint import pprint
-
+from typing import Tuple, Set
 
 ###
 # mtree file parsing
@@ -158,23 +158,28 @@ def all_files():
 SKIP_NEW = [
     re.compile(x).search
     for x in (
-        '^/home/', '^/tmp/',
-        '^/dev/', '^/proc/', '^/sys/', '^/run/',
-        '^/var/lib/pacman/', '^/var/cache/',
-        # FIXME: package ca-certificates-utils
+        '^/home/',
+        '^/tmp/', '^/dev/', '^/proc/', '^/sys/', '^/run/',
+        # package ca-certificates-utils
         '^/etc/ca-certificates/extracted/',
-        # FIXME: package shared-mime-info
+        # package shared-mime-info
         '^/usr/share/mime/',
-        # FIXME: package ca-certificates-utils, openssl
+        # package ca-certificates-utils, openssl
         '^/etc/ssl/certs/',
-        # FIXME: ???
+        # ???
         '^/boot/EFI/BOOT/icons',
-        # FIXME: package pacman-mirrorlist ?
+        # package pacman-mirrorlist ?
         '^/etc/pacman.d/gnupg/',
         # files that are created during use/not really worth backing up
+        '^/var/cache/',
         '^/var/log/',
+        '^/var/tmp/',
         '^/var/lib/docker',
+        '^/var/lib/pacman/',
+        '^/var/lib/systemd/coredump/',
         '/.cache/',
+        # swap file[s]
+        '^/swap',
     )]
 
 
@@ -230,28 +235,36 @@ def same_as_installed(path, keywords):
         return False
 
 
+@contextlib.contextmanager
 def progress(msg):
-    print(msg)
+    start_time = datetime.now()
+    print()
+    print(f'STARTED {msg}')
+    yield
+    end_time = datetime.now()
+    print(f'DONE   ({msg}) in {end_time - start_time}')
 
 
-def analyze_system(progress=progress):
-    progress('- reading install database (mtrees)')
-    mtree_keywords = read_all_mtrees()
-    installed = set(mtree_keywords.keys())
+def analyze_system(progress=progress) -> Tuple[Set[str], Set[str], Set[str]]:
+    with progress('reading install database (mtrees)'):
+        mtree_keywords = read_all_mtrees()
+        installed = set(mtree_keywords.keys())
 
-    progress('- reading files')
-    real_files = set(all_files())
+    with progress('reading file system'):
+        real_files = set(all_files())
 
-    new = set(
-        path for path in real_files.difference(installed)
-        if not ignored_new(path))
+        new = set(
+            path
+            for path in real_files.difference(installed)
+            if not ignored_new(path))
 
-    missing = installed.difference(real_files)
+        missing = installed.difference(real_files)
 
-    progress('- verifying files against install database')
-    changed = set(
-        path for path in real_files.intersection(installed)
-        if not same_as_installed(path, mtree_keywords[path]))
+    with progress('comparing file system against install database'):
+        changed = set(
+            path
+            for path in real_files.intersection(installed)
+            if not same_as_installed(path, mtree_keywords[path]))
 
     return new, missing, changed
 
@@ -265,14 +278,36 @@ def main():
 
     new, missing, changed = analyze_system()
 
-    def print_file_list(msg, files):
-        print(msg)
-        pprint(sorted(files))
-        print(len(files))
+    def print_file_list(file_list_name, files):
+        print()
+        print(f'{file_list_name} {len(files)} files:')
+        for file in sorted(files):
+            print(f'- {file}')
 
-    print_file_list('New (unknown) files:', new)
-    print_file_list('Missing files:', missing)
-    print_file_list('Changed files:', changed)
+    print_file_list('New (unknown)', new)
+    print_file_list('Missing', missing)
+    print_file_list('Changed', changed)
+
+    print_sizes('Archive size', new | changed)
+
+
+MEGABYTE = 1_000_000
+REPORTED_SIZE = 5_000_000
+
+def print_sizes(msg, paths) -> int:
+    print()
+    print(f'Calculating file sizes (showing files that are more than {REPORTED_SIZE} big):')
+    sum_sizes = 0
+    for path in paths:
+        try:
+            size = os.path.getsize(path)
+            if size > REPORTED_SIZE:
+                print(f'- {path}: {size / MEGABYTE:0.2f}MB')
+            sum_sizes += size
+        except Exception as e:
+            assert path in str(e)
+            print(f'- ERROR: {e}')
+    print(f'{msg}: {sum_sizes}')
 
 
 if __name__ == '__main__':
