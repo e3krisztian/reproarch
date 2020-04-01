@@ -2,17 +2,22 @@
 # coding: utf-8
 
 '''
-Analyze Arch installation and display extra, missing and changed files.
+Analyze Arch installation and display/archive extra, missing and changed files.
 
 This is done by comparing file system to the Arch installed packages database.
 
 The Arch installed packages database is in the /var/lib/pacman/local/*/mtree
 files, they contain a list of all the directories and files owned by the
-packages as well as their properties: file modes and hashes!
+packages as well as their properties: file modes and hashes.
 
 Usage:
     sudo ./analyze_arch.py
 
+Running as root is needed for proper operation, as some installed directories/files
+have restrictions for security (e.g. /etc/sudoers, /etc/passwd)
+
+
+DEVELOPMENT DIRECTION:
 
 Depending on available time this tool is intended to evolve into a install
 reproduction tool that outputs some data file with which it is trivial
@@ -32,12 +37,13 @@ import gzip
 import hashlib
 import re
 import os
+import subprocess
 import tarfile
 from typing import Tuple, Set
 
 MEGABYTE = 1_000_000
 
-KNOWN_NOT_PACKAGE_INSTALLED_AND_IGNORED_CHECKERS = [
+IGNORED_PATH_CHECKERS = [
     re.compile(x).search
     for x in (
         '^/home/',
@@ -65,33 +71,81 @@ KNOWN_NOT_PACKAGE_INSTALLED_AND_IGNORED_CHECKERS = [
     )]
 
 
-def known_not_package_installed_and_ignored(path):
-    return any(check(path) for check in KNOWN_NOT_PACKAGE_INSTALLED_AND_IGNORED_CHECKERS)
+def is_ignored_path(path):
+    return any(check(path) for check in IGNORED_PATH_CHECKERS)
+
+
+# Parsed command line arguments/flags
+args = None
+
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    arg = parser.add_argument
+    arg('--no-progress', action='store_false', dest='show_progress', default=True,
+        help='Do not show progress when analyzing the system.')
+    arg('--show-filenames', action='store_true', default=False,
+        help='Show all new/changed/missing files in packages (this can be a huge output).')
+    arg('-p', '--output-prefix', '--prefix', default='', dest='output_prefix',
+        help='Raw string prefix for all generated files')
+    arg('-n', '--dry-run', action='store_true', default=False,
+        help='Do not write any output files')
+    global args
+    args = parser.parse_args()
 
 
 def main():
+    parse_args()
+
+    if args.dry_run:
+        print('Dry run - will not write any files, despite saying so.')
     if os.getuid() != 0:
         print('WARNING: Not running as root!')
         print(
             'WARNING: Expect differences to reality due to ' +
             'missing permissions to open files/look into directories.')
 
-    new, missing, changed = analyze_system()
+    save_package_info()
 
-    def print_file_list(file_list_name, files):
+    new, missing, changed = compare_pacman_and_filesystem()
+
+    print_file_list('New, non-package installed', new)
+    print_file_list('Missing, package installed', missing)
+    print_file_list('Changed, package installed', changed)
+
+    print_sizes('Uncompressed new files archive size', new)
+    archive(new, 'non-package-installed-files')
+    print_sizes('Uncompressed changed files archive size', changed)
+    archive(changed, 'changed-package-installed-files')
+
+
+def save_package_info():
+    def pacman(options, output_filename):
+        command = f'/usr/bin/pacman {options}'
+        full_output_filename = f'{args.output_prefix}{output_filename}'
+        if args.show_progress:
+            print(f'Creating "{full_output_filename}" from output of "{command}"')
+        if args.dry_run:
+            return
+        with open(full_output_filename, 'w') as f:
+            subprocess.run(command.split(), stdout=f)
+
+    pacman('--query', 'all-packages.lst')
+    # official packages (Arch main repos)
+    pacman('--query --native --explicit', 'explicitly-installed-packages.lst')
+    pacman('--query --native', 'native-packages.lst')
+    # private packages (AUR)
+    pacman('--query --foreign', 'private-packages.lst')
+    pacman('--query --foreign --info', 'private-packages.info')
+    pacman('--query --foreign --list', 'private-packages.files')
+
+
+def print_file_list(file_list_name, files):
+    if args.show_filenames:
         print()
         print(f'{file_list_name} {len(files)} files:')
         for file in sorted(files):
             print(f'- {file}')
-
-    print_file_list('New (unknown)', new)
-    print_file_list('Missing', missing)
-    print_file_list('Changed', changed)
-
-    print_sizes('Uncompressed new files archive size', new)
-    archive(new, 'new.tar.gz')
-    print_sizes('Uncompressed changed files archive size', changed)
-    archive(changed, 'changed.tar.gz')
 
 
 REPORTED_SIZE = 5_000_000
@@ -103,30 +157,36 @@ def print_sizes(msg, paths) -> int:
     for path in paths:
         try:
             size = os.path.getsize(path)
-            if size > REPORTED_SIZE:
+            if size > REPORTED_SIZE and args.show_filenames:
                 print(f'- {path}: {size / MEGABYTE:0.2f}MB')
             sum_sizes += size
         except Exception as e:
             assert path in str(e)
-            print(f'- ERROR: {e}')
+            print(f'- can not get size: {e}')
     print(f'{msg}: {sum_sizes}')
 
 
-def archive(files, output):
+def archive(files, archive_name):
+    archive_filename = f'{args.output_prefix}{archive_name}.tar'
     if not files:
-        print(f'no files to write to {output} - it is not created')
+        print(f'No files to write to "{archive_filename}" - it is not created')
         return
-    print(f'Creating archive {output}:')
-    with tarfile.open(output, 'w:gz') as archive:
+    print(f'Creating "{archive_filename}":')
+    if args.dry_run:
+        return
+    # archive is to support deduplicating backup - like borg
+    # and store permissions, links
+    with tarfile.open(archive_filename, 'w') as archive:
         for file in sorted(files):
-            print(f'- {file}')
+            if args.show_filenames:
+                print(f'- {file}')
             archive.add(file, recursive=False)
 
 
-def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
+def compare_pacman_and_filesystem() -> Tuple[Set[str], Set[str], Set[str]]:
     @contextlib.contextmanager
     def progress(msg):
-        if verbosity:
+        if args.show_progress:
             start_time = datetime.now()
             print()
             print(f'STARTED {msg}')
@@ -136,7 +196,7 @@ def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
         else:
             yield
 
-    with progress('reading install database (mtrees)'):
+    with progress('reading pacman install database (mtrees)'):
         mtree_keywords = read_all_mtrees()
         installed = set(mtree_keywords.keys())
 
@@ -146,7 +206,7 @@ def analyze_system(verbosity=1) -> Tuple[Set[str], Set[str], Set[str]]:
         new = set(
             path
             for path in real_files.difference(installed)
-            if not known_not_package_installed_and_ignored(path))
+            if not is_ignored_path(path))
 
         missing = installed.difference(real_files)
 
@@ -208,7 +268,7 @@ def parse_path(word: bytes) -> str:
 assert parse_path(b'/path/to/strange\\033file') == '/path/to/strange\x1bfile'
 
 # regression test for subtle bug, when converting first to utf-8, then resolving the octal references
-assert parse_path(b'./usr/lib/go/test/fixedbugs/issue27836.dir/\\303\\204foo.go') == './usr/lib/go/test/fixedbugs/issue27836.dir/Äfoo.go'
+assert parse_path(b'go/issue27836.dir/\\303\\204foo.go') == 'go/issue27836.dir/Äfoo.go'
 
 
 open_mtree = gzip.open
